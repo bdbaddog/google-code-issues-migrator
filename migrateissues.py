@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-
+import pdb
 import optparse
 import sys
 import re
@@ -57,6 +57,9 @@ STATE_MAPPING = {
     'wontfix': "wontfix"
 }
 
+
+# Collection of projects
+found_projects = {}
 
 def output(string):
     sys.stdout.write(string)
@@ -140,14 +143,43 @@ def format_comment(comment):
     else: return "_From %s on %s_\n%s" % (author, date, content)
 
 
+def find_project_name(title,github_owner):
+    """ Try to figure out the project to assign this bug to based on the title"""
+    proj_name = 'plone.app.dexterity'
+    if title.find('plone.') != -1:
+        parts = title.split(' ')
+        proj = [p for p in parts if p.find('plone.') != -1]
+        proj_name = proj[0]
 
-def add_issue_to_github(issue):
+        parts = proj_name.split('.')
+        if len(parts) > 3:
+            proj_name = ".".join(parts[:3])
+#            print "truncated to:%s"%proj_name
+
+        #clean string to alphanum.alphanum.alphanum
+        proj_name = ''.join([c for c in proj_name if (c.isalnum() or c == '.')])
+    
+    try:
+        found_projects[proj_name]['count'] += 1
+    except KeyError:
+        found_projects[proj_name] = { 'count': 1,
+                                      'repo' : github_owner.get_repo(proj_name)}
+
+    return proj_name
+    
+
+def add_issue_to_github(issue,github_owner):
 
     """ Migrates the given Google Code issue to Github. """
 
     gid = parse_gcode_id(issue.id.text)
-    status = issue.status.text.lower()
+#    print "Processing issue:%s"%issue.id.text
+    status = issue.state.text.lower()
     title = issue.title.text
+    likely_project = find_project_name(title,github_owner)
+
+    output("issue:%s PROJ:%s TITLE:%s"%(gid,likely_project,title))
+
     link = issue.link[1].href
     author = issue.author[0].name.text
     content = issue.content.text
@@ -190,11 +222,16 @@ def add_issue_to_github(issue):
     body = "%s\n\n%s\n\n\n%s" % (header, content, footer)
     body = escape(body)
 
-    output("Adding issue %d" % gid)
+#    output("Adding issue %d" % gid)
 
     if not options.dry_run:
         github_labels = [ github_label(label) for label in labels ]
-        github_issue = github_repo.create_issue(title, body = body.encode("utf-8"), labels = github_labels)
+        github_repo = found_projects[likely_project]['repo']
+        try:
+            github_issue = github_repo.create_issue(title, body = body.encode("utf-8"), labels = github_labels)
+        except GithubException:
+            print "EXCEPTION: Trying to add issue to %s"%likely_project
+            raise
 
     # Assigns issues that originally had an owner to the current user
 
@@ -260,7 +297,7 @@ def add_comment_to_github(comment, github_issue):
         github_issue.create_comment(body.encode("utf-8"))
 
 
-def process_gcode_issues(existing_issues):
+def process_gcode_issues(existing_issues,github_owner):
 
     """ Migrates all Google Code issues in the given dictionary to Github. """
 
@@ -279,6 +316,11 @@ def process_gcode_issues(existing_issues):
         for issue in issues_feed.entry:
 
             gid = parse_gcode_id(issue.id.text)
+
+            if options.skip_closed and (issue.state.text == 'closed'):
+                #print "Skipping:ID:%s state:%s state:%s"%(gid,issue.title.text,issue.state.text)
+                continue
+
 
             # If we're trying to do a complete migration to a fresh Github project, and
             # want to keep the issue numbers synced with Google Code's, then we need to
@@ -305,7 +347,7 @@ def process_gcode_issues(existing_issues):
             if gid in existing_issues:
                 github_issue = existing_issues[gid]
                 output("Not adding issue %d (exists)" % gid)
-            else: github_issue = add_issue_to_github(issue)
+            else: github_issue = add_issue_to_github(issue,github_owner)
 
             if github_issue:
                 add_comments_to_issue(github_issue, gid)
@@ -365,6 +407,7 @@ if __name__ == "__main__":
     parser.add_option("-d", "--dry-run", action = "store_true", dest = "dry_run", help = "Don't modify anything on Github", default = False)
     parser.add_option("-p", "--omit-priority", action = "store_true", dest = "omit_priority", help = "Don't migrate priority labels", default = False)
     parser.add_option("-s", "--synchronize-ids", action = "store_true", dest = "synchronize_ids", help = "Ensure that migrated issues keep the same ID", default = False)
+    parser.add_option('--skip_closed',action = 'store_true',dest = 'skip_closed', help = 'Skip all closed bugs', default = False)
 
     options, args = parser.parse_args()
 
@@ -399,7 +442,14 @@ if __name__ == "__main__":
     try:
         existing_issues = get_existing_github_issues()
         log_rate_info()
-        process_gcode_issues(existing_issues)
+        process_gcode_issues(existing_issues,github_owner)
     except Exception:
         parser.print_help()
         raise
+
+    print "Found projects:"
+    for k in found_projects:
+        print "Proj:%s Count:%d"%(k,found_projects[k]['count'])
+        # try getting repot for each project.
+        github_repo = github_owner.get_repo(k)
+        
